@@ -1,19 +1,16 @@
 import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
-from pybit.unified_trading import HTTP
+import requests
 import pandas as pd
 import numpy as np
 import openai
-from config import BOT_TOKEN, OPENAI_API_KEY, ADMIN_IDS, CRYPTO_CURRENCIES, BYBIT_API_KEY, BYBIT_API_SECRET
+from config import BOT_TOKEN, OPENAI_API_KEY, ADMIN_IDS, CRYPTO_CURRENCIES
 import threading
 import time
 from datetime import datetime
 
 bot = telebot.TeleBot(BOT_TOKEN)
 openai.api_key = OPENAI_API_KEY
-
-# Подключение к Bybit
-session = HTTP(testnet=False, api_key=BYBIT_API_KEY, api_secret=BYBIT_API_SECRET)
 
 notify_settings = {admin_id: {crypto: False for crypto in CRYPTO_CURRENCIES} for admin_id in ADMIN_IDS}
 last_prices = {admin_id: {} for admin_id in ADMIN_IDS}
@@ -22,16 +19,21 @@ def is_admin(user_id):
     return user_id in ADMIN_IDS
 
 def get_klines_from_bybit(symbol, interval="15", limit=100):
-    """Получает свечные данные с Bybit"""
+    """Получает свечные данные с Bybit через прямой HTTP запрос"""
     try:
-        resp = session.get_kline(
-            category="spot",
-            symbol=symbol,
-            interval=interval,  # 1, 3, 5, 15, 30, 60, 120, 240, 360, 720, D, W, M
-            limit=limit
-        )
-        if resp["retCode"] == 0:
-            klines = resp["result"]["list"]
+        # Bybit v5 API
+        url = "https://api.bybit.com/v5/market/kline"
+        params = {
+            "category": "spot",
+            "symbol": symbol,
+            "interval": interval,
+            "limit": limit
+        }
+        response = requests.get(url, params=params, timeout=10)
+        data = response.json()
+        
+        if data["retCode"] == 0:
+            klines = data["result"]["list"]
             # Преобразуем в DataFrame
             df = pd.DataFrame(klines, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'turnover'])
             df['close'] = df['close'].astype(float)
@@ -65,9 +67,6 @@ def calculate_indicators(df):
     df['ma20'] = df['close'].rolling(window=20).mean()
     df['ma50'] = df['close'].rolling(window=50).mean()
     
-    # Объем
-    df['volume_ma'] = df['volume'].rolling(window=20).mean()
-    
     return df
 
 def analyze_with_ai_and_indicators(symbol, df):
@@ -75,7 +74,6 @@ def analyze_with_ai_and_indicators(symbol, df):
     last = df.iloc[-1]
     prev = df.iloc[-2]
     
-    # Получаем реальные данные
     current_price = last['close']
     prev_price = prev['close']
     price_change = ((current_price - prev_price) / prev_price) * 100
@@ -128,7 +126,7 @@ def analyze_with_ai_and_indicators(symbol, df):
         prediction = "флет"
         confidence = "средняя"
     
-    # Отправляем данные в AI для финального вердикта
+    # Отправляем данные в AI
     prompt = f"""
 Криптовалюта: {symbol}
 Текущая цена: {current_price} USDT
@@ -153,30 +151,29 @@ def analyze_with_ai_and_indicators(symbol, df):
     except Exception as e:
         ai_analysis = f"Ошибка AI: {e}"
     
-    # Формируем итоговый отчет
     result = f"""
-{symbol} - АНАЛИЗ РЫНКА
+{symbol} - АНАЛИЗ РЫНКА (Bybit)
 
 Текущая цена: {current_price} USDT
 Изменение: {price_change:+.2f}%
 
 ИНДИКАТОРЫ:
-RSI (14): {rsi:.1f} {"(перекуплен)" if rsi > 70 else "(перепродан)" if rsi < 30 else "(нейтрально)"}
+RSI (14): {rsi:.1f}
 MACD: {'бычий' if macd_hist > 0 else 'медвежий'}
 MA20: {ma20:.2f}
 MA50: {ma50:.2f}
 
-ПРОГНОЗ (на основе индикаторов): {prediction.upper()} ({confidence} уверенность)
+ПРОГНОЗ: {prediction.upper()} ({confidence} уверенность)
 
 AI АНАЛИЗ:
 {ai_analysis}
 
-Время анализа: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+Время: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 """
     return result, current_price
 
 def send_analysis(chat_id, crypto_symbol):
-    message = bot.send_message(chat_id, f"Загружаю свечные данные с Bybit для {crypto_symbol}...")
+    message = bot.send_message(chat_id, f"Загружаю данные с Bybit для {crypto_symbol}...")
     
     df = get_klines_from_bybit(crypto_symbol, interval="15", limit=100)
     
@@ -189,7 +186,6 @@ def send_analysis(chat_id, crypto_symbol):
     
     bot.edit_message_text(analysis, chat_id, message.message_id)
     
-    # Сохраняем цену для уведомлений
     for admin_id in ADMIN_IDS:
         last_prices[admin_id][crypto_symbol] = price
 
@@ -266,5 +262,5 @@ if __name__ == "__main__":
     monitor_thread = threading.Thread(target=monitor_prices, daemon=True)
     monitor_thread.start()
     
-    print("Бот запущен. Данные берутся с Bybit реального рынка")
+    print("Бот запущен. Данные берутся с Bybit через HTTP API")
     bot.infinity_polling()
