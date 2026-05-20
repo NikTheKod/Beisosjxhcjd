@@ -1,106 +1,217 @@
 import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
-import requests
+from pybit.unified_trading import HTTP
+import pandas as pd
+import numpy as np
 import openai
-from config import BOT_TOKEN, OPENAI_API_KEY, ADMIN_IDS, CRYPTO_CURRENCIES, QUOTE_CURRENCIES
+from config import BOT_TOKEN, OPENAI_API_KEY, ADMIN_IDS, CRYPTO_CURRENCIES, BYBIT_API_KEY, BYBIT_API_SECRET
 import threading
 import time
+from datetime import datetime
 
 bot = telebot.TeleBot(BOT_TOKEN)
 openai.api_key = OPENAI_API_KEY
 
-# Хранилище настроек уведомлений для админов: {admin_id: {"BTC": True/False, ...}}
-notify_settings = {admin_id: {crypto: False for crypto in CRYPTO_CURRENCIES} for admin_id in ADMIN_IDS}
+# Подключение к Bybit
+session = HTTP(testnet=False, api_key=BYBIT_API_KEY, api_secret=BYBIT_API_SECRET)
 
-# Последние цены для отслеживания изменений
+notify_settings = {admin_id: {crypto: False for crypto in CRYPTO_CURRENCIES} for admin_id in ADMIN_IDS}
 last_prices = {admin_id: {} for admin_id in ADMIN_IDS}
 
 def is_admin(user_id):
     return user_id in ADMIN_IDS
 
-def get_crypto_price(crypto, vs_currency="usd"):
-    url = f"https://api.coingecko.com/api/v3/simple/price?ids={crypto}&vs_currencies={vs_currency}"
+def get_klines_from_bybit(symbol, interval="15", limit=100):
+    """Получает свечные данные с Bybit"""
     try:
-        response = requests.get(url, timeout=10)
-        data = response.json()
-        if crypto in data and vs_currency in data[crypto]:
-            return data[crypto][vs_currency]
-    except:
-        pass
+        resp = session.get_kline(
+            category="spot",
+            symbol=symbol,
+            interval=interval,  # 1, 3, 5, 15, 30, 60, 120, 240, 360, 720, D, W, M
+            limit=limit
+        )
+        if resp["retCode"] == 0:
+            klines = resp["result"]["list"]
+            # Преобразуем в DataFrame
+            df = pd.DataFrame(klines, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'turnover'])
+            df['close'] = df['close'].astype(float)
+            df['open'] = df['open'].astype(float)
+            df['high'] = df['high'].astype(float)
+            df['low'] = df['low'].astype(float)
+            df['volume'] = df['volume'].astype(float)
+            df['timestamp'] = pd.to_datetime(df['timestamp'].astype(int), unit='ms')
+            return df
+    except Exception as e:
+        print(f"Bybit ошибка: {e}")
     return None
 
-def get_crypto_id(ticker):
-    mapping = {"BTC": "bitcoin", "ETH": "ethereum", "SOL": "solana"}
-    return mapping.get(ticker.upper())
+def calculate_indicators(df):
+    """Рассчитывает технические индикаторы"""
+    # RSI
+    delta = df['close'].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+    rs = gain / loss
+    df['rsi'] = 100 - (100 / (1 + rs))
+    
+    # MACD
+    exp1 = df['close'].ewm(span=12, adjust=False).mean()
+    exp2 = df['close'].ewm(span=26, adjust=False).mean()
+    df['macd'] = exp1 - exp2
+    df['signal'] = df['macd'].ewm(span=9, adjust=False).mean()
+    df['macd_hist'] = df['macd'] - df['signal']
+    
+    # Скользящие средние
+    df['ma20'] = df['close'].rolling(window=20).mean()
+    df['ma50'] = df['close'].rolling(window=50).mean()
+    
+    # Объем
+    df['volume_ma'] = df['volume'].rolling(window=20).mean()
+    
+    return df
 
-def analyze_with_ai(crypto, price_usd, price_rub):
+def analyze_with_ai_and_indicators(symbol, df):
+    """Анализирует рынок используя реальные индикаторы + AI"""
+    last = df.iloc[-1]
+    prev = df.iloc[-2]
+    
+    # Получаем реальные данные
+    current_price = last['close']
+    prev_price = prev['close']
+    price_change = ((current_price - prev_price) / prev_price) * 100
+    
+    rsi = last['rsi'] if not pd.isna(last['rsi']) else 50
+    macd_hist = last['macd_hist'] if not pd.isna(last['macd_hist']) else 0
+    ma20 = last['ma20'] if not pd.isna(last['ma20']) else current_price
+    ma50 = last['ma50'] if not pd.isna(last['ma50']) else current_price
+    
+    # Определяем тренд по индикаторам
+    trend_signals = []
+    
+    if rsi > 70:
+        trend_signals.append("RSI показывает перекупленность (сигнал к снижению)")
+    elif rsi < 30:
+        trend_signals.append("RSI показывает перепроданность (сигнал к росту)")
+    else:
+        trend_signals.append(f"RSI нейтральный ({rsi:.1f})")
+    
+    if macd_hist > 0:
+        trend_signals.append("MACD гистограмма положительная (бычий импульс)")
+    elif macd_hist < 0:
+        trend_signals.append("MACD гистограмма отрицательная (медвежий импульс)")
+    
+    if current_price > ma20 and current_price > ma50:
+        trend_signals.append("Цена выше MA20 и MA50 (восходящий тренд)")
+    elif current_price < ma20 and current_price < ma50:
+        trend_signals.append("Цена ниже MA20 и MA50 (нисходящий тренд)")
+    else:
+        trend_signals.append("Цена около скользящих средних (неопределенность)")
+    
+    # Формируем прогноз
+    bullish_score = 0
+    if rsi < 40:
+        bullish_score += 1
+    if macd_hist > 0:
+        bullish_score += 1
+    if current_price > ma20:
+        bullish_score += 1
+    if price_change > 0:
+        bullish_score += 0.5
+    
+    if bullish_score >= 2.5:
+        prediction = "вверх"
+        confidence = "высокая"
+    elif bullish_score <= 1:
+        prediction = "вниз"
+        confidence = "высокая"
+    else:
+        prediction = "флет"
+        confidence = "средняя"
+    
+    # Отправляем данные в AI для финального вердикта
     prompt = f"""
-Криптовалюта: {crypto}
-Цена сейчас: {price_usd} USD, {price_rub} RUB.
-Проанализируй краткосрочный тренд (ближайшие 1-4 часа). Куда пойдет график: вверх, вниз или флет? Дай краткий ответ (1-2 предложения) без лишнего текста.
+Криптовалюта: {symbol}
+Текущая цена: {current_price} USDT
+Изменение за последнюю свечу: {price_change:.2f}%
+
+Технические индикаторы:
+{'; '.join(trend_signals)}
+
+На основе этих реальных данных с биржи Bybit, куда вероятнее всего пойдет график в ближайшие 1-4 часа: вверх, вниз или флет?
+Ответь кратко (1-2 предложения) с обоснованием.
 """
+    
     try:
-        # Исправленный способ инициализации клиента для новых версий openai
-        client = openai.OpenAI(
-            api_key=OPENAI_API_KEY,
-            base_url="https://api.openai.com/v1"
-        )
+        client = openai.OpenAI(api_key=OPENAI_API_KEY)
         response = client.chat.completions.create(
             model="gpt-3.5-turbo",
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=50,
-            temperature=0.7
+            max_tokens=100,
+            temperature=0.5
         )
-        return response.choices[0].message.content.strip()
+        ai_analysis = response.choices[0].message.content.strip()
     except Exception as e:
-        return f"Ошибка AI: {str(e)}"
+        ai_analysis = f"Ошибка AI: {e}"
+    
+    # Формируем итоговый отчет
+    result = f"""
+{symbol} - АНАЛИЗ РЫНКА
 
-def send_analysis(chat_id, crypto):
-    crypto_id = get_crypto_id(crypto)
-    if not crypto_id:
-        bot.send_message(chat_id, f"Валюта {crypto} не найдена")
-        return
-    
-    price_usd = get_crypto_price(crypto_id, "usd")
-    price_rub = get_crypto_price(crypto_id, "rub")
-    
-    if price_usd is None:
-        bot.send_message(chat_id, f"Не удалось получить цену {crypto}")
-        return
-    
-    price_rub = price_rub if price_rub else price_usd * 90  # fallback
-    
-    bot.send_message(chat_id, f"Получаю анализ для {crypto}...")
-    analysis = analyze_with_ai(crypto, price_usd, price_rub)
-    
-    message = f"""
-{crypto}:
-Цена: {price_usd} USD
-Цена: {price_rub} RUB
-Анализ AI: {analysis}
+Текущая цена: {current_price} USDT
+Изменение: {price_change:+.2f}%
+
+ИНДИКАТОРЫ:
+RSI (14): {rsi:.1f} {"(перекуплен)" if rsi > 70 else "(перепродан)" if rsi < 30 else "(нейтрально)"}
+MACD: {'бычий' if macd_hist > 0 else 'медвежий'}
+MA20: {ma20:.2f}
+MA50: {ma50:.2f}
+
+ПРОГНОЗ (на основе индикаторов): {prediction.upper()} ({confidence} уверенность)
+
+AI АНАЛИЗ:
+{ai_analysis}
+
+Время анализа: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 """
-    bot.send_message(chat_id, message.strip())
+    return result, current_price
+
+def send_analysis(chat_id, crypto_symbol):
+    message = bot.send_message(chat_id, f"Загружаю свечные данные с Bybit для {crypto_symbol}...")
+    
+    df = get_klines_from_bybit(crypto_symbol, interval="15", limit=100)
+    
+    if df is None or len(df) < 50:
+        bot.edit_message_text(f"Ошибка: не удалось получить данные с Bybit для {crypto_symbol}", chat_id, message.message_id)
+        return
+    
+    df = calculate_indicators(df)
+    analysis, price = analyze_with_ai_and_indicators(crypto_symbol, df)
+    
+    bot.edit_message_text(analysis, chat_id, message.message_id)
+    
+    # Сохраняем цену для уведомлений
+    for admin_id in ADMIN_IDS:
+        last_prices[admin_id][crypto_symbol] = price
 
 def monitor_prices():
     while True:
         for admin_id in ADMIN_IDS:
             for crypto in CRYPTO_CURRENCIES:
                 if notify_settings[admin_id].get(crypto, False):
-                    crypto_id = get_crypto_id(crypto)
-                    if crypto_id:
-                        price_usd = get_crypto_price(crypto_id, "usd")
-                        if price_usd is not None:
-                            last = last_prices[admin_id].get(crypto)
-                            if last is not None:
-                                change = ((price_usd - last) / last) * 100
-                                if abs(change) >= 0.5:  # 0.5% порог
-                                    direction = "выросла" if change > 0 else "упала"
-                                    bot.send_message(
-                                        admin_id,
-                                        f"{crypto} цена {direction} на {abs(change):.2f}%: {price_usd} USD"
-                                    )
-                            last_prices[admin_id][crypto] = price_usd
-        time.sleep(60)  # проверка каждую минуту
+                    df = get_klines_from_bybit(crypto, interval="5", limit=5)
+                    if df is not None and len(df) > 0:
+                        current_price = df.iloc[-1]['close']
+                        last = last_prices[admin_id].get(crypto)
+                        if last is not None:
+                            change = ((current_price - last) / last) * 100
+                            if abs(change) >= 0.5:
+                                direction = "выросла" if change > 0 else "упала"
+                                bot.send_message(
+                                    admin_id,
+                                    f"{crypto} цена {direction} на {abs(change):.2f}%: {current_price} USDT"
+                                )
+                        last_prices[admin_id][crypto] = current_price
+        time.sleep(60)
 
 @bot.message_handler(commands=['start'])
 def start_command(message):
@@ -111,7 +222,7 @@ def start_command(message):
     markup = InlineKeyboardMarkup()
     for crypto in CRYPTO_CURRENCIES:
         markup.add(InlineKeyboardButton(crypto, callback_data=f"analyze_{crypto}"))
-    bot.send_message(message.chat.id, "Выберите валюту для анализа:", reply_markup=markup)
+    bot.send_message(message.chat.id, "Выберите валюту для анализа (данные с Bybit):", reply_markup=markup)
 
 @bot.message_handler(commands=['settings'])
 def settings_command(message):
@@ -145,7 +256,6 @@ def callback_handler(call):
         status = "включены" if notify_settings[admin_id][crypto] else "выключены"
         bot.answer_callback_query(call.id, f"Уведомления для {crypto} {status}")
         
-        # обновляем клавиатуру
         markup = InlineKeyboardMarkup()
         for c in CRYPTO_CURRENCIES:
             st = "Вкл" if notify_settings[admin_id].get(c, False) else "Выкл"
@@ -153,9 +263,8 @@ def callback_handler(call):
         bot.edit_message_text("Настройки уведомлений об изменении цены:", admin_id, call.message.message_id, reply_markup=markup)
 
 if __name__ == "__main__":
-    # Запускаем мониторинг цен в фоне
     monitor_thread = threading.Thread(target=monitor_prices, daemon=True)
     monitor_thread.start()
     
-    print("Бот запущен")
+    print("Бот запущен. Данные берутся с Bybit реального рынка")
     bot.infinity_polling()
