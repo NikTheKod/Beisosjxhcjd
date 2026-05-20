@@ -40,7 +40,11 @@ def analyze_with_ai(crypto, price_usd, price_rub):
 Проанализируй краткосрочный тренд (ближайшие 1-4 часа). Куда пойдет график: вверх, вниз или флет? Дай краткий ответ (1-2 предложения) без лишнего текста.
 """
     try:
-        client = openai.OpenAI(api_key=OPENAI_API_KEY)
+        # Исправленный способ инициализации клиента для новых версий openai
+        client = openai.OpenAI(
+            api_key=OPENAI_API_KEY,
+            base_url="https://api.openai.com/v1"
+        )
         response = client.chat.completions.create(
             model="gpt-3.5-turbo",
             messages=[{"role": "user", "content": prompt}],
